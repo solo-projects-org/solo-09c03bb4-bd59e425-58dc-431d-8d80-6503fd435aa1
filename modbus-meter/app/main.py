@@ -1,15 +1,29 @@
-"""FastAPI：单台 Modbus TCP 电表试采接口。"""
+"""FastAPI：单台 Modbus TCP 电表试采接口与 CSV 对账接口。"""
 
 from __future__ import annotations
 
 import os
+import tempfile
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
+from starlette.background import BackgroundTask
 
 from .planner import PlanError, Segment, plan_reads
+from .reconcile import (
+    CsvInputError,
+    NotReconcilable,
+    TableInput,
+    display_name,
+    safe_unlink,
+    validate_csv,
+    write_report,
+)
+from .registers import decode_unsigned
 
 DEFAULT_HOST = os.getenv("METER_HOST", "meter")
 DEFAULT_PORT = int(os.getenv("METER_PORT", "502"))
@@ -62,24 +76,19 @@ class ReadResponse(BaseModel):
 
 
 app = FastAPI(
-    title="Modbus TCP 电表试采接口",
-    version="1.0.0",
+    title="Modbus TCP 电表试采与用电对账接口",
+    version="1.1.0",
     description=(
-        "提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
+        "试采：提交测点保持寄存器起始地址（从 0 算）与字数（1 或 2），"
         "并给出设备可读区间（含两端）与单次读取上限。"
         "接口先做读段规划（请求次数最少，次数相同则读取寄存器总数最少），"
         "再逐段读取，返回读段与无符号计数（双字高字在前）。"
-        "无可行方案或读取失败时直接报错，不返回部分读数。"
+        "无可行方案或读取失败时直接报错，不返回部分读数。\n\n"
+        "对账：上传网关导出的总表 CSV 与至少一份支路表 CSV，"
+        "按所有表都有读数的相邻时刻划段，"
+        "输出各段起止秒及“总表增量 - 各支路增量之和”的差额。"
     ),
 )
-
-
-def decode_unsigned(words: list[int]) -> int:
-    """无符号拼接；双字高字在前（big-endian / 高字在低地址）。"""
-    value = 0
-    for word in words:
-        value = (value << 16) | (word & 0xFFFF)
-    return value
 
 
 @app.get("/", include_in_schema=False)
@@ -175,3 +184,129 @@ async def read_meter(req: ReadRequest) -> ReadResponse:
         segments=seg_out,
         points=points_out,
     )
+
+
+async def _reconcile_response(
+    main_upload: UploadFile | None,
+    branch_uploads: list[UploadFile] | None,
+) -> FileResponse:
+    """校验全部上传文件后，以流式方式生成报告，完成后再发送。"""
+    if main_upload is None:
+        raise HTTPException(
+            status_code=422,
+            detail="缺少总表 CSV（字段名 main_csv）",
+        )
+    branches = [item for item in (branch_uploads or []) if item is not None]
+    if not branches:
+        raise HTTPException(
+            status_code=422,
+            detail="至少需要一份支路表 CSV（字段名 branch_csvs）",
+        )
+
+    tables = [TableInput(display_name(main_upload, "main.csv"), main_upload)]
+    for index, upload in enumerate(branches, start=1):
+        tables.append(
+            TableInput(display_name(upload, f"branch_{index}.csv"), upload)
+        )
+
+    # 第一遍：逐行读完并校验所有文件。任一坏行/非递增都会在发送响应前报错。
+    try:
+        for table in tables:
+            validate_csv(table.upload, table.filename)
+    except CsvInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # 第二遍：逐行读入、逐段写入临时文件；报告不驻留内存。
+    fd, report_path = tempfile.mkstemp(prefix="reconcile-", suffix=".csv")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as out:
+            common_count = write_report(tables, out)
+        if common_count < 2:
+            raise NotReconcilable(common_count)
+    except NotReconcilable as exc:
+        safe_unlink(report_path)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except CsvInputError as exc:
+        safe_unlink(report_path)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BaseException:
+        safe_unlink(report_path)
+        raise
+
+    # 所有输入均已读完并校验，报告完整落盘后才开始发送。
+    return FileResponse(
+        report_path,
+        media_type="text/csv",
+        filename="reconciliation.csv",
+        background=BackgroundTask(safe_unlink, report_path),
+    )
+
+
+@app.post(
+    "/reconcile",
+    response_class=FileResponse,
+    summary="上传总表与支路表 CSV 进行用电对账",
+    description=(
+        "总表与支路表使用相同计数单位和倍率。每份 CSV 无表头，"
+        "每行三列：`UTC 采样秒,高字,低字`（可识别的表头行会自动跳过）；"
+        "计数按高字在前解码。"
+        "报告 CSV 列出相邻共同采样时刻所划各段的起止秒与差额"
+        "（总表增量 - 各支路增量之和）；段内有计数下降的表列入"
+        "`abnormal_files` 且该段差额留空。"
+    ),
+    responses={
+        200: {
+            "description": "对账报告（text/csv）",
+            "content": {"text/csv": {}},
+        },
+        422: {
+            "description": (
+                "缺少总表/支路表、坏行、采样秒未严格递增，"
+                "或共同采样时刻不足 2 个；detail 含文件名与行号，"
+                "不返回部分报告"
+            )
+        },
+    },
+)
+async def reconcile(
+    main_csv: Annotated[
+        UploadFile,
+        File(
+            description="总表 CSV：UTC 采样秒,高字,低字（无表头）",
+            validation_alias=AliasChoices(
+                "main_csv",
+                "main_file",
+                "main",
+                "total_csv",
+                "total",
+                "main_meter",
+            ),
+        ),
+    ],
+    branch_csvs: Annotated[
+        list[UploadFile],
+        File(
+            description="支路表 CSV，至少一份，格式与总表相同",
+            validation_alias=AliasChoices(
+                "branch_csvs",
+                "branch_files",
+                "branches",
+                "branch_csv",
+                "branch",
+                "branch_meters",
+                "branch_meter",
+            ),
+        ),
+    ],
+) -> FileResponse:
+    return await _reconcile_response(main_csv, branch_csvs)
+
+
+# 兼容另一个常见的路径名；Swagger 中只展示 /reconcile。
+app.add_api_route(
+    "/reconciliation",
+    reconcile,
+    methods=["POST"],
+    include_in_schema=False,
+    response_class=FileResponse,
+)

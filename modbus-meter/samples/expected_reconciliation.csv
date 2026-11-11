@@ -1,0 +1,3 @@
+segment_start_utc,segment_end_utc,difference,abnormal_files
+1767225600,1767225660,20,
+1767225660,1767225720,,branch_b.csv
